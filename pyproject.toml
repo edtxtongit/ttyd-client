@@ -5,8 +5,8 @@ description = "A Python client library for connecting to TTYD (tty over WebSocke
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "requests>=2.32.5",
-    "websocket-client>=1.9.0",
+    "requests>=2.32.5,<3",
+    "websocket-client>=1.9.0,<2",
 ]
 
 [project.optional-dependencies]

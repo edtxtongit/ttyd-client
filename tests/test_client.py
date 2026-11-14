@@ -1,169 +1,153 @@
-"""
-Tests for TTYD WebSocket client.
-"""
+"""WebSocket protocol, output, TLS and lifecycle regression tests."""
 
+import io
+import json
+import ssl
 import unittest
 from unittest.mock import Mock, patch
+
+import websocket
 
 from ttyd_cli.client import TTYDClient
 
 
 class TestTTYDClient(unittest.TestCase):
-    """Test cases for TTYDClient."""
-
-    @patch("ttyd_cli.client.authenticate")
+    @patch("ttyd_cli.client.authenticate", return_value="test_token")
     def setUp(self, mock_auth):
-        """Set up test client."""
-        mock_auth.return_value = "test_token"
-        self.client = TTYDClient(url="http://localhost:7681", credential="user:pass", verify=False)
+        self.client = TTYDClient("http://localhost:7681", "user:pass", verify=False)
 
-    def test_client_initialization(self):
-        """Test client initialization."""
+    def test_initialization(self):
         self.assertEqual(self.client.credential, "test_token")
-        self.assertEqual(self.client.cmd, "")
         self.assertFalse(self.client.connected)
-        self.assertFalse(self.client._connection_established)
+        self.assertEqual(self.client.subprotocols, ["tty"])
+        self.assertEqual(self.client.header, ["Authorization: Basic dXNlcjpwYXNz"])
 
-    def test_filter_output_foreground_color(self):
-        """Test filtering foreground color query."""
-        data = b"\x1b]10;rgb:0000/0000/0000\x07Hello"
-        filtered = self.client._filter_output(data)
-        self.assertEqual(filtered, b"Hello")
+    def test_websocket_redirects_are_disabled(self):
+        connection = Mock()
+        original_connect = connection.connect
+        self.client.sock = connection
+        self.client.sock.connect("wss://localhost/ws", header=self.client.header)
+        original_connect.assert_called_once_with(
+            "wss://localhost/ws", header=self.client.header, redirect_limit=0
+        )
+        self.client.sock = None
 
-    def test_filter_output_background_color(self):
-        """Test filtering background color query."""
-        data = b"\x1b]11;rgb:ffff/ffff/ffff\x07World"
-        filtered = self.client._filter_output(data)
-        self.assertEqual(filtered, b"World")
+    @patch("ttyd_cli.client.authenticate", return_value=None)
+    def test_url_and_argument_encoding(self, mock_auth):
+        client = TTYDClient("https://localhost/base/?arg=first", args=["second arg", "third&arg"])
+        self.assertEqual(
+            client.url, "wss://localhost/base/ws?arg=first&arg=second+arg&arg=third%26arg"
+        )
+        self.assertEqual(client.header, [])
 
-    def test_filter_output_device_attributes(self):
-        """Test filtering device attributes query."""
-        data = b"\x1b[>0cTest"
-        filtered = self.client._filter_output(data)
-        self.assertEqual(filtered, b"Test")
-
-    def test_filter_output_primary_da(self):
-        """Test filtering primary DA query."""
-        data = b"\x1b[?1;2cData"
-        filtered = self.client._filter_output(data)
-        self.assertEqual(filtered, b"Data")
-
-    def test_filter_output_dcs_sequence(self):
-        """Test filtering DCS sequences."""
-        data = b"\x1bPtest\x1b\\Content"
-        filtered = self.client._filter_output(data)
-        self.assertEqual(filtered, b"Content")
-
-    def test_filter_output_multiple_queries(self):
-        """Test filtering multiple query sequences."""
-        data = b"\x1b]10;rgb:0000/0000/0000\x07\x1b[>0cHello\x1b]11;rgb:ffff/ffff/ffff\x07"
-        filtered = self.client._filter_output(data)
-        self.assertEqual(filtered, b"Hello")
-
-    def test_filter_output_no_queries(self):
-        """Test output without query sequences."""
-        data = b"Plain text output"
-        filtered = self.client._filter_output(data)
-        self.assertEqual(filtered, data)
-
-    def test_on_close_not_connected(self):
-        """Test on_close when not connected."""
-        mock_ws = Mock()
-        with patch("builtins.print") as mock_print:
-            self.client._on_close(mock_ws, 1000, "Normal")
-            mock_print.assert_called_once_with("connection refused")
-
-    def test_on_close_with_input_handler(self):
-        """Test on_close with input handler."""
-        mock_ws = Mock()
-        mock_handler = Mock()
-        self.client._connection_established = True
-        self.client._input_handler = mock_handler
-
-        self.client._on_close(mock_ws, 1000, "Normal")
-
-        mock_handler.restore_terminal.assert_called_once()
-        mock_handler.stop.assert_called_once()
-        self.assertFalse(self.client.connected)
-
-    @patch("ttyd_cli.client.get_terminal_size")
-    def test_resize(self, mock_size):
-        """Test terminal resize."""
-        mock_size.return_value = (80, 24)
-        with patch.object(self.client, "send") as mock_send:
-            self.client._resize()
-            mock_send.assert_called_once_with('1{"columns":80,"rows":24}')
-
-    def test_send_command_newline(self):
-        """Test sending newline command."""
+    def test_multiframe_utf8(self):
         self.client.connected = True
-        with patch.object(self.client, "send") as mock_send:
-            self.client._send_command("\n")
-            mock_send.assert_called_once_with("0\r")
+        encoded = "中文".encode()
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            for byte in encoded:
+                self.client._on_message(self.client, b"0" + bytes([byte]))
+            self.assertEqual(output.getvalue(), "中文")
 
-    def test_send_command_regular_char(self):
-        """Test sending regular character."""
+    def test_empty_and_control_messages(self):
         self.client.connected = True
-        with patch.object(self.client, "send") as mock_send:
-            self.client._send_command("a")
-            mock_send.assert_called_once_with("0a")
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            for message in (b"", b"1title", b"2{}", b"0"):
+                self.client._on_message(self.client, message)
+            self.assertEqual(output.getvalue(), "")
 
-    def test_send_command_not_connected(self):
-        """Test sending command when not connected."""
-        self.client.connected = False
-        self.client._connection_established = True
-        with self.assertRaises(SystemExit) as cm:
-            self.client._send_command("test")
-        self.assertEqual(cm.exception.code, 0)
-
-    def test_on_message_output(self):
-        """Test handling output message."""
+    def test_close_flushes_pending_output(self):
         self.client.connected = True
-        mock_ws = Mock()
-        msg = b"0Hello World"
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.client._on_message(self.client, b"0text\x1b")
+            self.client._on_close(self.client, 1000, "")
+            self.client._on_close(self.client, 1000, "")
+            self.assertEqual(output.getvalue(), "text\x1b")
 
-        with patch("sys.stdout") as mock_stdout:
-            self.client._on_message(mock_ws, msg)
-            mock_stdout.write.assert_called()
+    def test_close_stops_and_joins_before_restore(self):
+        handler = Mock()
+        thread = Mock()
+        thread.is_alive.return_value = False
+        manager = Mock()
+        manager.attach_mock(handler, "handler")
+        manager.attach_mock(thread, "thread")
+        self.client._input_handler = handler
+        self.client._input_thread = thread
+        self.client._on_close(self.client, 1000, "")
+        names = [call[0] for call in manager.mock_calls]
+        self.assertLess(names.index("handler.stop"), names.index("thread.join"))
+        self.assertLess(names.index("thread.join"), names.index("handler.restore_terminal"))
 
-    @patch("ttyd_cli.client.Thread")
+    def test_send_command_preserves_bytes(self):
+        self.client.connected = True
+        with patch.object(self.client, "send") as send:
+            self.client._send_command(b"\x03\x04\x1b[A\xff")
+        send.assert_called_once_with(b"0\x03\x04\x1b[A\xff", opcode=websocket.ABNF.OPCODE_BINARY)
+
+    def test_send_command_encodes_text_and_command_newlines(self):
+        self.client.connected = True
+        with patch.object(self.client, "send") as send:
+            self.client._send_command("echo 中文\n")
+        send.assert_called_once_with("0echo 中文\r".encode(), opcode=websocket.ABNF.OPCODE_BINARY)
+
+    def test_disconnected_input_is_not_sent(self):
+        with patch.object(self.client, "send") as send:
+            self.client._send_command("late input")
+        send.assert_not_called()
+
+    @patch("ttyd_cli.client.get_terminal_size", return_value=(80, 24))
+    def test_on_open_initializes_token_and_dimensions(self, mock_size):
+        with patch.object(self.client, "send") as send:
+            self.client._on_open(self.client)
+        payload = json.loads(send.call_args.args[0])
+        self.assertEqual(payload, {"AuthToken": "test_token", "columns": 80, "rows": 24})
+        self.assertEqual(send.call_count, 1)
+        self.client._on_close(self.client, 1000, "")
+
     @patch("ttyd_cli.client.InputHandler")
-    def test_on_message_first_connection(self, mock_handler_class, mock_thread):
-        """Test first message after connection."""
-        mock_ws = Mock()
-        msg = b"0"
+    @patch("ttyd_cli.client.Thread")
+    def test_first_message_starts_input_once(self, mock_thread, mock_handler):
         self.client.cmd = "ls"
-
-        with patch.object(self.client, "_send_command") as mock_send:
-            self.client._on_message(mock_ws, msg)
-            mock_send.assert_called_with("ls\n")
-            self.assertTrue(self.client.connected)
-            self.assertTrue(self.client._connection_established)
-
-    @patch("ttyd_cli.client.get_terminal_size")
-    def test_on_open(self, mock_size):
-        """Test WebSocket open event."""
-        mock_ws = Mock()
-        mock_size.return_value = (80, 24)
-
-        with patch.object(self.client, "send") as mock_send:
-            self.client._on_open(mock_ws)
-            # Should send auth token and terminal size
-            self.assertEqual(mock_send.call_count, 2)
-
-
-class TestTTYDClientWindows(unittest.TestCase):
-    """Test cases for Windows-specific functionality."""
+        with patch.object(self.client, "_send_command") as send:
+            self.client._on_message(self.client, b"1title")
+            self.client._on_message(self.client, b"2{}")
+        mock_handler.assert_called_once()
+        mock_thread.return_value.start.assert_called_once()
+        send.assert_called_once_with("ls\n")
 
     @patch("ttyd_cli.client.IS_WINDOWS", True)
-    @patch("ttyd_cli.client.authenticate")
-    def test_windows_resize_monitor_initialization(self, mock_auth):
-        """Test Windows resize monitor initialization."""
-        mock_auth.return_value = "test_token"
-        client = TTYDClient(url="http://localhost:7681")
-        self.assertIsNone(client._last_size)
-        self.assertFalse(client._resize_monitor_running)
+    @patch("ttyd_cli.client.get_terminal_size")
+    @patch("ttyd_cli.client.Thread")
+    def test_windows_resize_monitor_starts_after_connected(self, mock_thread, mock_size):
+        self.client._start_windows_resize_monitor()
+        mock_thread.assert_not_called()
+        self.client.connected = True
+        mock_size.side_effect = [(80, 24), (100, 30)]
+        with (
+            patch.object(self.client._resize_stop, "wait", side_effect=[False, True]),
+            patch.object(self.client, "_resize") as resize,
+        ):
+            mock_thread.return_value.start.side_effect = lambda: mock_thread.call_args.kwargs[
+                "target"
+            ]()
+            self.client._start_windows_resize_monitor()
+        resize.assert_called_once()
 
+    @patch("websocket.WebSocketApp.run_forever", return_value=False)
+    def test_no_verify_applies_to_websocket(self, run):
+        self.client.run_forever()
+        options = run.call_args.kwargs
+        self.assertEqual(options["sslopt"]["cert_reqs"], ssl.CERT_NONE)
+        self.assertFalse(options["sslopt"]["check_hostname"])
+        self.assertEqual(options["origin"], "http://localhost:7681")
 
-if __name__ == "__main__":
-    unittest.main()
+    @patch("websocket.WebSocketApp.run_forever", return_value=False)
+    def test_custom_ca(self, run):
+        self.client._verify = "/workspace/custom-ca.pem"
+        self.client.run_forever()
+        self.assertEqual(run.call_args.kwargs["sslopt"]["ca_certs"], "/workspace/custom-ca.pem")
+
+    @patch("websocket.WebSocketApp.run_forever", return_value=False)
+    def test_default_keeps_verification_enabled(self, run):
+        self.client._verify = True
+        self.client.run_forever()
+        self.assertNotIn("cert_reqs", run.call_args.kwargs["sslopt"])

@@ -3,7 +3,7 @@
 # 🖥️ TTYD Client
 <img src="assets/icon.png" alt="TTYD Client Icon" width="120" height="120" />
 
-[![Python Version](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
+[![Python Version](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](https://github.com/krypton-byte/ttyd-client)
 
@@ -14,6 +14,38 @@
 </div>
 
 ---
+
+## Fork fixes / 修复版说明
+
+This fork requires Python 3.12+. Install the checked-out fork with `pip install .`; the PyPI command in the upstream sections installs the upstream release, not these fixes.
+
+本次开发和验证仅在云沙箱 `/workspace` 进行，不访问用户主机。以下命令用于云沙箱终端中的源码安装和连接：
+
+```sh
+cd /workspace/ttyd-client-review
+python3 -m venv .venv
+.venv/bin/pip install .
+.venv/bin/ttyd-client --url https://YOUR_TTYD_HOST:7681
+```
+
+- Probe `/token` without credentials, report TLS and Basic authentication, then prompt for a username and hidden password only when required.
+- Bare `host:port` probes HTTPS first and may probe plaintext HTTP without credentials after a compatible handshake/connection failure. Certificate verification errors never trigger a downgrade. Explicit `https://` never falls back to HTTP. Redirects are refused; supply the final ttyd URL.
+- `--ca-file CA.pem` verifies a private/self-signed CA for both HTTP and WebSocket. `--no-verify` disables both checks and is for testing only.
+- Plaintext Basic login requires typing `yes` or explicitly using `--allow-http-auth`. Legacy `--credential` remains supported, but exposes the password in process arguments; prefer hidden input or `--username alice --password-env TTYD_PASSWORD`.
+- `--check` validates discovery/login without creating a shell. `--timeout` bounds HTTP requests. HTTP and WebSocket bypass environment proxies by default.
+- Output is incrementally decoded and filtered across WebSocket messages. Exact known color/device queries are suppressed; normal OSC color settings and DCS/APC display sequences are preserved. Only connect to trusted servers: this is not an ANSI security sanitizer.
+- Unix input is passed as raw bytes without guessing which sequences are keys or terminal responses. Shutdown stops and joins the input thread before restoring the terminal. Windows F1–F12 and resize startup are corrected.
+- Basic credentials protect ttyd itself; a shell's `login` or SSH password prompt is a separate remote interaction. ttyd must use `-W` to accept input on versions that default to read-only.
+
+```sh
+ttyd-client --url YOUR_TTYD_HOST:7681
+ttyd-client --url https://YOUR_TTYD_HOST/terminal/ --username alice
+ttyd-client --url https://YOUR_TTYD_HOST:7681 --ca-file /workspace/ca.pem
+ttyd-client --url https://YOUR_TTYD_HOST:7681 --check
+ttyd-client --url http://127.0.0.1:7681 --args bash --login
+```
+
+Run regression tests with `pytest`. Optional real-server tests require POSIX, `openssl`, and `TTYD_BINARY` (or ttyd on PATH); set `TTYD_TEST_TMPDIR=/workspace` to keep all test artifacts in the cloud workspace. Tests cover Chinese output, authentication prompts, HTTP/TLS, Ctrl+C, resize and terminal restoration. Windows key/resize tests are simulated, not a Windows end-to-end certification.
 
 ## English
 
@@ -41,7 +73,7 @@ pip install ttyd-client
 
 #### Requirements
 
-- Python 3.7+
+- Python 3.12+
 - websocket-client
 - requests
 
@@ -50,38 +82,38 @@ pip install ttyd-client
 #### Basic Connection
 
 ```bash
-ttyd-client http://localhost:7681
+ttyd-client --url http://localhost:7681
 ```
 
 #### With Authentication
 
 ```bash
-ttyd-client https://example.com:7681 --credential "username:password"
+ttyd-client --url https://example.com:7681 --username username
 ```
 
 #### Disable SSL Verification
 
 ```bash
-ttyd-client https://example.com:7681 --no-verify
+ttyd-client --url https://example.com:7681 --no-verify
 ```
 
 #### Execute Command on Connect
 
 ```bash
-ttyd-client http://localhost:7681 --cmd "ls -la"
+ttyd-client --url http://localhost:7681 --cmd "ls -la"
 ```
 
 #### Pass Arguments to Remote Shell
 
 ```bash
-ttyd-client http://localhost:7681 --args bash --login
+ttyd-client --url http://localhost:7681 --args bash --login
 ```
 
 ### 🛠️ Command Line Options
 
 | Option | Description |
 |--------|-------------|
-| `url` | TTYD server URL (required) |
+| `--url` | TTYD server URL (required) |
 | `--credential` | Authentication in format "username:password" |
 | `--no-verify` | Disable SSL certificate verification |
 | `--cmd` | Command to execute on connection |
@@ -110,11 +142,9 @@ ttyd_cli/
 
 The client automatically filters terminal device control sequences such as:
 - Color queries (OSC 10, 11, 12, 4)
-- Device attribute queries (CSI > c, CSI ? c)
-- Cursor position reports
-- DCS/APC sequences
+- Known device attribute queries (CSI c, CSI > c, CSI = c)
 
-This prevents terminal responses from being interpreted as keyboard input.
+Normal display sequences and raw keyboard/terminal-response input are preserved.
 
 #### Platform-Specific Input Handling
 
@@ -127,7 +157,7 @@ This prevents terminal responses from being interpreted as keyboard input.
 
 ```bash
 # Start ttyd server
-ttyd -p 7681 bash
+ttyd -W -p 7681 bash
 
 # Connect with client
 ttyd-client --url http://localhost:7681
@@ -181,7 +211,7 @@ pip install ttyd-client
 
 #### Persyaratan
 
-- Python 3.7+
+- Python 3.12+
 - websocket-client
 - requests
 
@@ -221,7 +251,7 @@ ttyd-client --url http://localhost:7681 --args bash --login
 
 | Opsi | Deskripsi |
 |------|-----------|
-| `url` | URL server TTYD (wajib) |
+| `--url` | URL server TTYD (wajib) |
 | `--credential` | Autentikasi dengan format "username:password" |
 | `--no-verify` | Nonaktifkan verifikasi sertifikat SSL |
 | `--cmd` | Perintah yang dijalankan saat koneksi |
@@ -250,11 +280,9 @@ ttyd_cli/
 
 Klien secara otomatis memfilter device control sequences terminal seperti:
 - Query warna (OSC 10, 11, 12, 4)
-- Query atribut perangkat (CSI > c, CSI ? c)
-- Laporan posisi kursor
-- Sequences DCS/APC
+- Query atribut perangkat yang dikenal (CSI c, CSI > c, CSI = c)
 
-Ini mencegah respons terminal ditafsirkan sebagai input keyboard.
+Sequences tampilan normal dan input mentah tetap diteruskan.
 
 #### Penanganan Input Spesifik Platform
 
@@ -267,7 +295,7 @@ Ini mencegah respons terminal ditafsirkan sebagai input keyboard.
 
 ```bash
 # Jalankan ttyd server
-ttyd -p 7681 bash
+ttyd -W -p 7681 bash
 
 # Koneksi dengan client
 ttyd-client --url http://localhost:7681
@@ -321,7 +349,7 @@ pip install ttyd-client
 
 #### 要求
 
-- Python 3.7+
+- Python 3.12+
 - websocket-client
 - requests
 
@@ -361,7 +389,7 @@ ttyd-client --url http://localhost:7681 --args bash --login
 
 | 选项 | 描述 |
 |------|------|
-| `url` | TTYD 服务器 URL（必需）|
+| `--url` | TTYD 服务器 URL（必需）|
 | `--credential` | 格式为 "username:password" 的身份验证 |
 | `--no-verify` | 禁用 SSL 证书验证 |
 | `--cmd` | 连接时执行的命令 |
@@ -390,11 +418,9 @@ ttyd_cli/
 
 客户端自动过滤终端设备控制序列，例如：
 - 颜色查询（OSC 10、11、12、4）
-- 设备属性查询（CSI > c、CSI ? c）
-- 光标位置报告
-- DCS/APC 序列
+- 已知设备属性查询（CSI c、CSI > c、CSI = c）
 
-这可以防止终端响应被解释为键盘输入。
+正常的颜色设置和 DCS/APC 显示序列保留；键盘和终端响应按原始输入转发。
 
 #### 平台特定输入处理
 
@@ -407,7 +433,7 @@ ttyd_cli/
 
 ```bash
 # 启动 ttyd 服务器
-ttyd -p 7681 bash
+ttyd -W -p 7681 bash
 
 # 使用客户端连接
 ttyd-client --url http://localhost:7681

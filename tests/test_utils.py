@@ -25,7 +25,7 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(rows, 30)
 
     @patch("ttyd_cli.utils.IS_WINDOWS", True)
-    @patch("os.get_terminal_size")
+    @patch("shutil.get_terminal_size")
     def test_get_terminal_size_windows(self, mock_get_size):
         """Test getting terminal size on Windows."""
         mock_size = Mock()

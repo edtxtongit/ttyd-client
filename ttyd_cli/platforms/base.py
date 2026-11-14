@@ -4,6 +4,7 @@ Base class for platform-specific input handlers.
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from threading import RLock
 
 
 class TerminalInputHandler(ABC):
@@ -11,42 +12,46 @@ class TerminalInputHandler(ABC):
     Abstract base class for terminal input handling.
     """
 
-    def __init__(self, send_callback: Callable[[str], None]) -> None:
+    def __init__(self, send_callback: Callable[[str | bytes], None]) -> None:
         """
         Initialize input handler.
 
         Args:
             send_callback: Function to call when sending input to remote
         """
-        self.send_callback: Callable[[str], None] = send_callback
+        self.send_callback: Callable[[str | bytes], None] = send_callback
         self.connected: bool = True
+        self._state_lock = RLock()
 
     @abstractmethod
-    def read_input(self) -> str | None:
+    def read_input(self) -> str | bytes | None:
         """
-        Read a single input from terminal.
-
-        Returns:
-            Optional[str]: The input character(s) or escape sequence
+        Read input from terminal as text or raw bytes.
         """
-        pass
 
     @abstractmethod
     def run(self) -> None:
         """
         Main input loop.
         """
-        pass
 
     @abstractmethod
     def restore_terminal(self) -> None:
         """
         Restore terminal to original state.
         """
-        pass
+
+    def _send_input(self, data: str | bytes) -> None:
+        """
+        Send input only while the handler is running.
+        """
+        with self._state_lock:
+            if self.connected:
+                self.send_callback(data)
 
     def stop(self) -> None:
         """
-        Signal the input handler to stop.
+        Prevent further sends and signal the input loop to stop.
         """
-        self.connected = False
+        with self._state_lock:
+            self.connected = False

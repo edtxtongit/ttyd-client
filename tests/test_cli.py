@@ -1,106 +1,94 @@
-"""
-Tests for CLI module.
-"""
+"""CLI regression tests against the actual entry point."""
 
 import unittest
 from unittest.mock import Mock, patch
 
-from ttyd_cli.cli import main
-from ttyd_cli.exceptions import InvalidAuthorization
+from ttyd_cli.__main__ import main, parse_arguments
 
 
 class TestCLI(unittest.TestCase):
-    """Test cases for CLI."""
+    @patch("ttyd_cli.__main__.authenticate")
+    @patch("ttyd_cli.__main__.discover", return_value=("https://localhost", False))
+    def test_check_does_not_open_shell(self, mock_discover, mock_auth):
+        with patch("ttyd_cli.__main__.TTYDClient") as mock_client:
+            self.assertEqual(main(["--url", "localhost", "--check"]), 0)
+        mock_client.assert_not_called()
+        mock_auth.assert_called_once()
 
-    @patch("ttyd_cli.cli.TTYDClient")
-    @patch("sys.argv", ["ttyd-client", "http://localhost:7681"])
-    def test_main_basic(self, mock_client_class):
-        """Test basic CLI invocation."""
-        mock_client = Mock()
-        mock_client_class.return_value = mock_client
+    @patch("ttyd_cli.__main__.authenticate")
+    @patch("ttyd_cli.__main__.discover", return_value=("https://localhost", True))
+    @patch("ttyd_cli.__main__.getpass.getpass", return_value="secret")
+    def test_hidden_password_prompt(self, mock_password, mock_discover, mock_auth):
+        with patch("sys.stdin.isatty", return_value=True):
+            self.assertEqual(main(["--url", "https://localhost", "-u", "alice", "--check"]), 0)
+        mock_auth.assert_called_once_with("https://localhost", "alice:secret", True, timeout=10)
 
-        main()
+    @patch("ttyd_cli.__main__.discover", return_value=("http://localhost", True))
+    def test_plaintext_auth_is_refused_noninteractive(self, mock_discover):
+        with (
+            patch("sys.stdin.isatty", return_value=False),
+            patch("ttyd_cli.__main__.authenticate") as mock_auth,
+        ):
+            self.assertEqual(
+                main(["--url", "http://localhost", "--check", "--credential", "alice:secret"]), 1
+            )
+        mock_auth.assert_not_called()
 
-        mock_client_class.assert_called_once()
-        mock_client.run_forever.assert_called_once()
+    @patch("ttyd_cli.__main__.authenticate")
+    @patch("ttyd_cli.__main__.discover", return_value=("http://localhost", True))
+    def test_password_environment(self, mock_discover, mock_auth):
+        with (
+            patch("sys.stdin.isatty", return_value=False),
+            patch.dict("os.environ", {"DEMO_PASS": "secret"}),
+        ):
+            result = main(
+                [
+                    "--url",
+                    "http://localhost",
+                    "--check",
+                    "--allow-http-auth",
+                    "-u",
+                    "alice",
+                    "--password-env",
+                    "DEMO_PASS",
+                ]
+            )
+        self.assertEqual(result, 0)
+        mock_auth.assert_called_once_with("http://localhost", "alice:secret", True, timeout=10)
 
-    @patch("ttyd_cli.cli.TTYDClient")
-    @patch("sys.argv", ["ttyd-client", "http://localhost:7681", "-c", "user:pass"])
-    def test_main_with_credential(self, mock_client_class):
-        """Test CLI with credentials."""
-        mock_client = Mock()
-        mock_client_class.return_value = mock_client
+    @patch("ttyd_cli.__main__.TTYDClient")
+    @patch("ttyd_cli.__main__.discover", return_value=("https://localhost", False))
+    def test_interactive(self, mock_discover, mock_client):
+        mock_client.return_value = Mock(_connection_established=True)
+        mock_client.return_value.run_forever.return_value = False
+        with (
+            patch("sys.stdin.isatty", return_value=True),
+            patch("sys.stdout.isatty", return_value=True),
+        ):
+            self.assertEqual(main(["--url", "https://localhost", "--cmd", "ls"]), 0)
+        self.assertEqual(mock_client.call_args.kwargs["cmd"], "ls")
 
-        main()
+    @patch("ttyd_cli.__main__.TTYDClient")
+    @patch("ttyd_cli.__main__.discover", return_value=("https://localhost", False))
+    def test_websocket_failure_returns_nonzero(self, mock_discover, mock_client):
+        mock_client.return_value.run_forever.return_value = True
+        with (
+            patch("sys.stdin.isatty", return_value=True),
+            patch("sys.stdout.isatty", return_value=True),
+        ):
+            self.assertEqual(main(["--url", "https://localhost"]), 1)
 
-        args = mock_client_class.call_args[1]
-        self.assertEqual(args["credential"], "user:pass")
+    def test_remote_args(self):
+        self.assertEqual(
+            parse_arguments(["--url", "http://localhost", "--args", "bash", "--login"]).args,
+            ["bash", "--login"],
+        )
 
-    @patch("ttyd_cli.cli.TTYDClient")
-    @patch("sys.argv", ["ttyd-client", "http://localhost:7681", "--cmd", "ls -la"])
-    def test_main_with_command(self, mock_client_class):
-        """Test CLI with command."""
-        mock_client = Mock()
-        mock_client_class.return_value = mock_client
+    def test_invalid_timeout(self):
+        for timeout in ("0", "-1", "nan", "inf"):
+            with self.subTest(timeout=timeout), self.assertRaises(SystemExit):
+                parse_arguments(["--url", "https://localhost", "--timeout", timeout])
 
-        main()
-
-        args = mock_client_class.call_args[1]
-        self.assertEqual(args["cmd"], "ls -la")
-
-    @patch("ttyd_cli.cli.TTYDClient")
-    @patch("sys.argv", ["ttyd-client", "http://localhost:7681", "--no-verify"])
-    def test_main_no_verify(self, mock_client_class):
-        """Test CLI with SSL verification disabled."""
-        mock_client = Mock()
-        mock_client_class.return_value = mock_client
-
-        main()
-
-        args = mock_client_class.call_args[1]
-        self.assertFalse(args["verify"])
-
-    @patch("ttyd_cli.cli.TTYDClient")
-    @patch("sys.argv", ["ttyd-client", "http://localhost:7681", "-a", "bash", "--login"])
-    def test_main_with_args(self, mock_client_class):
-        """Test CLI with shell arguments."""
-        mock_client = Mock()
-        mock_client_class.return_value = mock_client
-
-        main()
-
-        args = mock_client_class.call_args[1]
-        self.assertEqual(args["args"], ["bash", "--login"])
-
-    @patch("ttyd_cli.cli.TTYDClient")
-    @patch("sys.argv", ["ttyd-client", "http://localhost:7681"])
-    def test_main_invalid_auth(self, mock_client_class):
-        """Test CLI with authentication failure."""
-        mock_client_class.side_effect = InvalidAuthorization("Invalid credentials")
-
-        with self.assertRaises(SystemExit) as cm:
-            main()
-        self.assertEqual(cm.exception.code, 1)
-
-    @patch("ttyd_cli.cli.TTYDClient")
-    @patch("sys.argv", ["ttyd-client", "http://localhost:7681"])
-    def test_main_keyboard_interrupt(self, mock_client_class):
-        """Test CLI with keyboard interrupt."""
-        mock_client = Mock()
-        mock_client.run_forever.side_effect = KeyboardInterrupt()
-        mock_client_class.return_value = mock_client
-
-        with self.assertRaises(SystemExit) as cm:
-            main()
-        self.assertEqual(cm.exception.code, 0)
-
-    @patch("sys.argv", ["ttyd-client", "--version"])
-    def test_main_version(self):
-        """Test CLI version display."""
-        with self.assertRaises(SystemExit) as cm:
-            main()
-        self.assertEqual(cm.exception.code, 0)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_conflicting_certificate_options(self):
+        with self.assertRaises(SystemExit):
+            parse_arguments(["--url", "https://localhost", "--no-verify", "--ca-file", "ca.pem"])

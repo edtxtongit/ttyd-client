@@ -1,19 +1,20 @@
-"""
-TTYD WebSocket client implementation.
-"""
+"""TTYD WebSocket client implementation."""
 
 from __future__ import annotations
 
-import re
+import base64
+import codecs
+import json
+import ssl
 import sys
-import time
-from sys import stdout
-from threading import Thread
-from urllib.parse import quote
+from functools import partial
+from threading import Event, Thread, current_thread
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import websocket
 
-from .auth import authenticate
+from .auth import authenticate, normalize_url
+from .output import TerminalOutputFilter
 from .platforms import InputHandler
 from .utils import IS_WINDOWS, get_terminal_size
 
@@ -22,214 +23,199 @@ if not IS_WINDOWS:
 
 
 class TTYDClient(websocket.WebSocketApp):
-    """
-    WebSocket client for TTYD terminal connections.
-    """
+    """WebSocket terminal client with interruptible input and incremental output."""
 
-    # Regex patterns for terminal query sequences that should be filtered
-    QUERY_PATTERNS = [
-        rb"\x1b\]10;[^\x07\x1b]*(?:\x07|\x1b\\)",  # Foreground color query
-        rb"\x1b\]11;[^\x07\x1b]*(?:\x07|\x1b\\)",  # Background color query
-        rb"\x1b\]12;[^\x07\x1b]*(?:\x07|\x1b\\)",  # Cursor color query
-        rb"\x1b\]4;[^\x07\x1b]*(?:\x07|\x1b\\)",  # Color palette query
-        rb"\x1b\[>\d*[cq]",  # Device attributes query
-        rb"\x1b\[\?[0-9;]*c",  # Primary DA query
-        rb"\x1b\[=\d*c",  # Secondary DA query
-        rb"\x1bP[^\x1b]*\x1b\\",  # DCS sequences
-        rb"\x1b_[^\x1b]*\x1b\\",  # APC sequences
-    ]
+    @property
+    def sock(self):
+        return self._socket
+
+    @sock.setter
+    def sock(self, connection):
+        """Disable automatic redirects on each socket created by WebSocketApp."""
+        self._socket = connection
+        if connection is not None:
+            connection.connect = partial(connection.connect, redirect_limit=0)
 
     def __init__(
         self,
         url: str,
         credential: str | None = None,
-        args: list[str] = [],
+        args: list[str] | None = None,
         cmd: str = "",
-        verify: bool = True,
+        verify: bool | str = True,
+        timeout: float = 10,
     ) -> None:
-        """
-        Initialize TTYD client.
-
-        Args:
-            url: Base URL of TTYD server (http/https)
-            credential: Optional authentication in format "username:password"
-            args: Command line arguments to pass to remote shell
-            cmd: Command to execute on connection
-            verify: Whether to verify SSL certificates
-
-        Raises:
-            InvalidAuthorization: If authentication fails
-        """
-        # Authenticate and get token
-        token = authenticate(url, credential, verify)
-
-        # Build WebSocket URL
-        ws_url = "ws" + url[4:] + "/ws?" + "".join([f"arg={quote(x)}" for x in args])
-        headers = [
-            "Sec-WebSocket-Protocol: tty",
-            f"Authorization: Basic {token}" if token else "Authorization: Basic ",
-        ]
-
+        url = normalize_url(url)
+        token = authenticate(url, credential, verify, timeout=timeout)
+        parsed = urlsplit(url)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        query.extend(("arg", argument) for argument in (args or []))
+        ws_url = urlunsplit(
+            (
+                "wss" if parsed.scheme == "https" else "ws",
+                parsed.netloc,
+                parsed.path + "/ws",
+                urlencode(query),
+                "",
+            )
+        )
+        headers = []
+        if token and credential:
+            encoded = base64.b64encode(credential.encode("utf-8")).decode("ascii")
+            headers.append(f"Authorization: Basic {encoded}")
         super().__init__(
             ws_url,
             header=headers,
+            subprotocols=["tty"],
             on_open=self._on_open,
             on_message=self._on_message,
             on_close=self._on_close,
+            on_error=self._on_error,
         )
-
-        self.credential: str | None = token
-        self.cmd: str = cmd
-        self.connected: bool = False
-        self._connection_established: bool = False
-        self._input_handler: InputHandler | None = None
-
-        # Compile regex patterns for performance
-        self._query_regex = re.compile(b"|".join(self.QUERY_PATTERNS))
-
-        # Windows resize monitoring
-        if IS_WINDOWS:
-            self._last_size: tuple | None = None
-            self._resize_monitor_running: bool = False
+        self.credential = token
+        self.cmd = cmd
+        self.connected = False
+        self._connection_established = False
+        self._input_handler = None
+        self._input_thread = None
+        self._resize_thread = None
+        self._resize_stop = Event()
+        self._last_size = None
+        self._resize_monitor_running = False
+        self._previous_resize_handler = None
+        self._resize_handler_installed = False
+        self._output_filter = TerminalOutputFilter()
+        self._output_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._output_finished = False
+        self._verify = verify
+        self._origin = f"{parsed.scheme}://{parsed.netloc}"
+        self._hostname = parsed.hostname
+        self.last_error = None
 
     def _filter_output(self, data: bytes) -> bytes:
-        """
-        Filter out terminal query sequences from server output.
+        return self._output_filter.feed(data)
 
-        These queries would cause the local terminal to send responses,
-        which would then be read as keyboard input and sent back to server.
+    def _write_output(self, data: bytes, final: bool = False) -> None:
+        text = self._output_decoder.decode(data, final=final)
+        if text:
+            sys.stdout.write(text)
+            sys.stdout.flush()
 
-        Args:
-            data: Raw output data from server
-
-        Returns:
-            bytes: Filtered output data
-        """
-        # Remove all query sequences
-        filtered = self._query_regex.sub(b"", data)
-        return filtered
-
-    def _on_close(self, ws: websocket.WebSocketApp, code: int, msg: str) -> None:
-        """
-        Handle WebSocket close event.
-
-        Args:
-            ws: WebSocket instance
-            code: Close status code
-            msg: Close message
-        """
-        if not self._connection_established:
-            print("connection refused")
-
-        if self._input_handler:
-            self._input_handler.restore_terminal()
-            self._input_handler.stop()
-
-        # Stop Windows resize monitor
-        if IS_WINDOWS:
-            self._resize_monitor_running = False
-
+    def _stop_io(self) -> None:
         self.connected = False
+        self._resize_monitor_running = False
+        self._resize_stop.set()
+        if self._input_handler:
+            self._input_handler.stop()
+        for thread in (self._input_thread, self._resize_thread):
+            if thread is not None and thread is not current_thread():
+                thread.join(timeout=2)
+        if self._input_handler and (
+            self._input_thread is None or not self._input_thread.is_alive()
+        ):
+            self._input_handler.restore_terminal()
+        if self._resize_handler_installed:
+            try:
+                signal(SIGWINCH, self._previous_resize_handler)
+                self._resize_handler_installed = False
+            except ValueError:
+                pass
 
-    def _on_message(self, ws: websocket.WebSocketApp, msg: bytes) -> None:
-        """
-        Handle incoming WebSocket messages.
+    def _on_close(self, ws: websocket.WebSocketApp, code: int | None, msg: str | None) -> None:
+        self._stop_io()
+        if not self._output_finished:
+            self._write_output(self._output_filter.flush(), final=True)
+            self._output_finished = True
 
-        Args:
-            ws: WebSocket instance
-            msg: Message payload
-        """
+    def _on_error(self, ws: websocket.WebSocketApp, error: Exception) -> None:
+        self.last_error = error
+
+    def _on_message(self, ws: websocket.WebSocketApp, msg: bytes | str) -> None:
+        if not msg:
+            return
+        if isinstance(msg, str):
+            msg = msg.encode("utf-8")
         if not self.connected:
             self.connected = True
             self._connection_established = True
-
+            self._input_handler = InputHandler(self._send_command)
+            self._input_thread = Thread(target=self._input_handler.run, daemon=True)
+            self._input_thread.start()
+            if IS_WINDOWS:
+                self._start_windows_resize_monitor()
             if self.cmd:
                 self._send_command(self.cmd + "\n")
+        if msg[:1] == b"0":
+            self._write_output(self._filter_output(msg[1:]))
 
-            # Start input handler thread
-            self._input_handler = InputHandler(self._send_command)
-            thread = Thread(target=self._input_handler.run)
-            thread.daemon = True
-            thread.start()
+    def _resize(self, *arguments) -> None:
+        columns, rows = get_terminal_size()
+        self.send(
+            b"1" + json.dumps({"columns": columns, "rows": rows}).encode("utf-8"),
+            opcode=websocket.ABNF.OPCODE_BINARY,
+        )
 
-        # Message type 0 = output
-        if msg[0] == 48:
-            # Filter the output before writing to stdout
-            filtered_output = self._filter_output(msg[1:])
-            if filtered_output:  # Only write if there's something left after filtering
-                stdout.write(filtered_output.decode(errors="replace"))
-                stdout.flush()
-
-    def _resize(self, *args) -> None:
-        """
-        Handle terminal resize event.
-
-        Args:
-            *args: Signal handler arguments (unused)
-        """
-        cols, rows = get_terminal_size()
-        self.send('1{"columns":%s,"rows":%s}' % (cols, rows))
-
-    def _send_command(self, c: str) -> None:
-        """
-        Send command to remote terminal.
-
-        Args:
-            c: Command string to send
-        """
+    def _send_command(self, command: str | bytes) -> None:
         if not self.connected:
-            if self._input_handler:
-                self._input_handler.restore_terminal()
-            sys.exit(0 if self._connection_established else 1)
-
-        # Convert newline to carriage return for terminal
-        self.send("0" + ("\r" if c == "\n" else c))
+            return
+        if isinstance(command, str):
+            command = command.replace("\n", "\r").encode("utf-8")
+        self.send(b"0" + command, opcode=websocket.ABNF.OPCODE_BINARY)
 
     def _start_windows_resize_monitor(self) -> None:
-        """
-        Start monitoring terminal size changes on Windows.
-        Runs in a separate thread and polls for size changes.
-        """
-        if not IS_WINDOWS:
+        if not IS_WINDOWS or not self.connected:
             return
+        if self._resize_thread is not None and self._resize_thread.is_alive():
+            return
+        self._last_size = get_terminal_size()
+        self._resize_stop.clear()
+        self._resize_monitor_running = True
 
         def monitor_resize():
-            self._resize_monitor_running = True
-            self._last_size = get_terminal_size()
-
-            while self._resize_monitor_running and self.connected:
-                try:
-                    current_size = get_terminal_size()
-                    if current_size != self._last_size:
-                        self._last_size = current_size
+            try:
+                while not self._resize_stop.wait(0.25):
+                    if not self.connected:
+                        break
+                    size = get_terminal_size()
+                    if size != self._last_size:
+                        self._last_size = size
                         self._resize()
-                    time.sleep(0.5)  # Check every 500ms
-                except Exception:
-                    pass
+            finally:
+                self._resize_monitor_running = False
 
-        thread = Thread(target=monitor_resize)
-        thread.daemon = True
-        thread.start()
+        self._resize_thread = Thread(target=monitor_resize, daemon=True)
+        self._resize_thread.start()
 
     def _on_open(self, ws: websocket.WebSocketApp) -> None:
-        """
-        Handle WebSocket open event.
-
-        Args:
-            ws: WebSocket instance
-        """
-        # Send authentication token
-        self.send('{"AuthToken":"%s"}' % (self.credential or ""))
-
-        # Setup window resize signal (Unix only)
+        if self._input_thread is not None and self._input_thread.is_alive():
+            raise RuntimeError("Previous terminal input thread is still running")
+        self._output_filter = TerminalOutputFilter()
+        self._output_decoder.reset()
+        self._output_finished = False
+        self.connected = False
+        self._connection_established = False
+        self.last_error = None
+        columns, rows = get_terminal_size()
+        message = {"AuthToken": self.credential or "", "columns": columns, "rows": rows}
+        self.send(json.dumps(message).encode("utf-8"), opcode=websocket.ABNF.OPCODE_BINARY)
         if not IS_WINDOWS:
             try:
-                signal(SIGWINCH, self._resize)
-            except Exception:
+                self._previous_resize_handler = signal(SIGWINCH, self._resize)
+                self._resize_handler_installed = True
+            except ValueError:
                 pass
-        else:
-            # Start resize monitoring for Windows
-            self._start_windows_resize_monitor()
 
-        # Send initial terminal size
-        self._resize()
+    def run_forever(self, **options):
+        ssl_options = dict(options.pop("sslopt", None) or {})
+        if self._verify is False:
+            ssl_options.setdefault("cert_reqs", ssl.CERT_NONE)
+            ssl_options.setdefault("check_hostname", False)
+        elif isinstance(self._verify, str):
+            ssl_options.setdefault("ca_certs", self._verify)
+            ssl_options.setdefault("cert_reqs", ssl.CERT_REQUIRED)
+        options.setdefault("origin", self._origin)
+        options.setdefault("http_no_proxy", [self._hostname])
+        try:
+            return super().run_forever(sslopt=ssl_options, **options)
+        finally:
+            self._on_close(self, None, None)
