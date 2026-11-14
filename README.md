@@ -19,13 +19,12 @@
 
 This fork requires Python 3.12+. Install the checked-out fork with `pip install .`; the PyPI command in the upstream sections installs the upstream release, not these fixes.
 
-本次开发和验证仅在云沙箱 `/workspace` 进行，不访问用户主机。以下命令用于云沙箱终端中的源码安装和连接：
+安装此 fork（需要 Python 3.12+）：
 
 ```sh
-cd /workspace/ttyd-client-review
-python3 -m venv .venv
-.venv/bin/pip install .
-.venv/bin/ttyd-client --url https://YOUR_TTYD_HOST:7681
+python -m pip install --upgrade --force-reinstall \
+  "https://github.com/edtxtongit/ttyd-client/archive/refs/heads/master.zip"
+ttyd-client --url https://YOUR_TTYD_HOST:7681
 ```
 
 - Probe `/token` without credentials, report TLS and Basic authentication, then prompt for a username and hidden password only when required.
@@ -40,12 +39,12 @@ python3 -m venv .venv
 ```sh
 ttyd-client --url YOUR_TTYD_HOST:7681
 ttyd-client --url https://YOUR_TTYD_HOST/terminal/ --username alice
-ttyd-client --url https://YOUR_TTYD_HOST:7681 --ca-file /workspace/ca.pem
+ttyd-client --url https://YOUR_TTYD_HOST:7681 --ca-file ca.pem
 ttyd-client --url https://YOUR_TTYD_HOST:7681 --check
 ttyd-client --url http://127.0.0.1:7681 --args bash --login
 ```
 
-Run regression tests with `pytest`. Optional real-server tests require POSIX, `openssl`, and `TTYD_BINARY` (or ttyd on PATH); set `TTYD_TEST_TMPDIR=/workspace` to keep all test artifacts in the cloud workspace. Tests cover Chinese output, authentication prompts, HTTP/TLS, Ctrl+C, resize and terminal restoration. Windows key/resize tests are simulated, not a Windows end-to-end certification.
+Run regression tests with `pytest`. Optional real-server tests require POSIX, `openssl`, and `TTYD_BINARY` (or ttyd on PATH); `TTYD_TEST_TMPDIR` optionally selects the directory for test artifacts. Tests cover Chinese output, authentication prompts, HTTP/TLS, Ctrl+C, resize and terminal restoration. Windows key/resize tests are simulated, not a Windows end-to-end certification.
 
 ## English
 
