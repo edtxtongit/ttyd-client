@@ -108,6 +108,7 @@ def login_credential(arguments, secure):
 
 
 def main(argv=None) -> int:
+    stage = "Service discovery"
     try:
         arguments = parse_arguments(argv)
         if not arguments.check and (not sys.stdin.isatty() or not sys.stdout.isatty()):
@@ -128,6 +129,7 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
         credential = login_credential(arguments, secure) if required else None
+        stage = "HTTP authentication (/token)"
         if arguments.check:
             authenticate(url, credential, verify, timeout=arguments.timeout)
             print("Check passed; no remote terminal was started.", file=sys.stderr)
@@ -140,6 +142,7 @@ def main(argv=None) -> int:
             verify=verify,
             timeout=arguments.timeout,
         )
+        stage = "WebSocket connection (/ws)"
         failed = client.run_forever()
         if failed or not client._connection_established:
             raise InvalidAuthorization(
@@ -151,7 +154,10 @@ def main(argv=None) -> int:
     except EOFError:
         print("[!] Login input ended", file=sys.stderr)
         return 1
-    except (InvalidAuthorization, requests.RequestException, OSError, ValueError) as error:
+    except requests.RequestException as error:
+        print(f"[!] {stage} failed: {error}", file=sys.stderr)
+        return 1
+    except (InvalidAuthorization, OSError, ValueError) as error:
         print(f"[!] {error}", file=sys.stderr)
         return 1
 

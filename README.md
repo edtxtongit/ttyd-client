@@ -22,7 +22,7 @@ This fork requires Python 3.12+. Install the checked-out fork with `pip install 
 安装此 fork（需要 Python 3.12+）：
 
 ```sh
-python -m pip install --upgrade --force-reinstall \
+python -m pip install --upgrade --force-reinstall --no-cache-dir \
   "https://github.com/edtxtongit/ttyd-client/archive/refs/heads/master.zip"
 ttyd-client --url https://YOUR_TTYD_HOST:7681
 ```
@@ -32,6 +32,7 @@ ttyd-client --url https://YOUR_TTYD_HOST:7681
 - `--ca-file CA.pem` verifies a private/self-signed CA for both HTTP and WebSocket. `--no-verify` disables both checks and is for testing only.
 - Plaintext Basic login requires typing `yes` or explicitly using `--allow-http-auth`. Legacy `--credential` remains supported, but exposes the password in process arguments; prefer hidden input or `--username alice --password-env TTYD_PASSWORD`.
 - `--check` validates discovery/login without creating a shell. `--timeout` bounds HTTP requests. HTTP and WebSocket bypass environment proxies by default.
+- Token requests use fresh connections so login does not reuse a socket closed after a `401` challenge. Network errors identify the discovery, HTTP authentication, or WebSocket stage; use `--check` to isolate HTTP login.
 - Output is incrementally decoded and filtered across WebSocket messages. Exact known color/device queries are suppressed; normal OSC color settings and DCS/APC display sequences are preserved. Only connect to trusted servers: this is not an ANSI security sanitizer.
 - Unix input is passed as raw bytes without guessing which sequences are keys or terminal responses. Shutdown stops and joins the input thread before restoring the terminal. Windows F1–F12 and resize startup are corrected.
 - Basic credentials protect ttyd itself; a shell's `login` or SSH password prompt is a separate remote interaction. ttyd must use `-W` to accept input on versions that default to read-only.

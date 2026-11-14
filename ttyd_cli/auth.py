@@ -55,8 +55,11 @@ class WebPage(Session):
         return token or None
 
     def check(self) -> str | None:
-        with self.get(self.token_url, timeout=self.timeout, allow_redirects=False) as response:
-            return self._token(response)
+        try:
+            with self.get(self.token_url, timeout=self.timeout, allow_redirects=False) as response:
+                return self._token(response)
+        finally:
+            self.close()
 
     def token(self, username: str, password: str) -> str | None:
         if not username or ":" in username:

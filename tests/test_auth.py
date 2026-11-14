@@ -1,7 +1,9 @@
 """Authentication and TLS discovery regression tests."""
 
 import json
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 import requests
@@ -118,3 +120,49 @@ class TestAuthentication(unittest.TestCase):
         ):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 normalize_url(url)
+
+
+class TestAuthenticationConnections(unittest.TestCase):
+    def test_challenged_connection_is_not_reused_for_login(self):
+        received = []
+        encoded = "dXNlcjpwYXNz"
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                authorization = self.headers.get("Authorization")
+                received.append((self.client_address, authorization))
+                if getattr(self, "challenged", False):
+                    self.close_connection = True
+                    return
+                if authorization is None:
+                    self.challenged = True
+                    self.send_response(401)
+                    self.send_header("WWW-Authenticate", 'Basic realm="ttyd"')
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = json.dumps({"token": encoded}).encode()
+                self.send_response(200 if authorization == f"Basic {encoded}" else 403)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, message, *arguments):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}"
+            self.assertEqual(authenticate(url, "user:pass", timeout=2), encoded)
+            self.assertEqual(len(received), 2)
+            self.assertIsNone(received[0][1])
+            self.assertEqual(received[1][1], f"Basic {encoded}")
+            self.assertNotEqual(received[0][0], received[1][0])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)

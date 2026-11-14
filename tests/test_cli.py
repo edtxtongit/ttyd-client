@@ -1,7 +1,10 @@
 """CLI regression tests against the actual entry point."""
 
+import io
 import unittest
 from unittest.mock import Mock, patch
+
+import requests
 
 from ttyd_cli.__main__ import main, parse_arguments
 
@@ -92,3 +95,22 @@ class TestCLI(unittest.TestCase):
     def test_conflicting_certificate_options(self):
         with self.assertRaises(SystemExit):
             parse_arguments(["--url", "https://localhost", "--no-verify", "--ca-file", "ca.pem"])
+
+    @patch(
+        "ttyd_cli.__main__.discover",
+        side_effect=requests.exceptions.ConnectionError("Connection aborted."),
+    )
+    def test_discovery_error_identifies_stage(self, mock_discover):
+        with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(main(["--url", "http://localhost", "--check"]), 1)
+        self.assertIn("Service discovery failed: Connection aborted.", stderr.getvalue())
+
+    @patch(
+        "ttyd_cli.__main__.authenticate",
+        side_effect=requests.exceptions.ConnectionError("Connection aborted."),
+    )
+    @patch("ttyd_cli.__main__.discover", return_value=("http://localhost", False))
+    def test_authentication_error_identifies_stage(self, mock_discover, mock_auth):
+        with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(main(["--url", "http://localhost", "--check"]), 1)
+        self.assertIn("HTTP authentication (/token) failed: Connection aborted.", stderr.getvalue())
